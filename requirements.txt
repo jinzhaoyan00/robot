@@ -5,26 +5,25 @@ faiss-cpu>=1.7.4
 rank-bm25>=0.2.2
 jieba>=0.42.1
 
-# 嵌入模型（ModelScope GTE-base）
+# 嵌入模型（ModelScope 下载 + HuggingFace 推理）
 modelscope>=1.9.0
+transformers>=4.30.0
+torch>=2.0.0
 
-# 知识图谱（graphiti + KuZu）
+# 知识图谱（graphiti + KuZu 图数据库）
 graphiti-core[kuzu]>=0.28.0
 
 # LLM 调用（阿里云 DashScope OpenAI 兼容接口）
 openai>=1.0.0
 
-# 环境变量与配置文件
+# 环境变量与配置
 python-dotenv>=1.0.0
 
 # 科学计算
 numpy>=1.24.0
 
-
-# mcp
+# MCP 远程工具服务
 mcp>=1.6.0
 httpx>=0.27.0
 uvicorn>=0.27.0
 starlette>=0.37.0
-
-

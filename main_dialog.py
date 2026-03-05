@@ -21,7 +21,7 @@ import argparse
 import sys
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncGenerator
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -45,6 +45,82 @@ from prompts import (                                                      # noq
     build_skill_extract_system, SKILL_ANSWER_SYSTEM,
     ETHICS_RESPONSE, FALLBACK_RESPONSE,
 )
+
+
+# ══════════════════════════════════════════════════════════════════
+# <think> 标签过滤器（流式状态机）
+# ══════════════════════════════════════════════════════════════════
+
+class ThinkStripper:
+    """
+    从流式 token 中实时过滤 <think>...</think> 块。
+
+    使用状态机 + 前缀暂存缓冲区，可正确处理标签跨 token 分割的情况：
+    - 正常状态：发现 <think> 之前的内容立即输出；若末尾是 <think> 的
+      某个前缀则暂存，等待后续 token 确认。
+    - think 状态：丢弃所有内容直到找到 </think>；结束标签之后的
+      首行换行符一并跳过。
+    """
+
+    _OPEN  = "<think>"
+    _CLOSE = "</think>"
+
+    def __init__(self) -> None:
+        self._buf      = ""
+        self._in_think = False
+
+    def feed(self, token: str) -> str:
+        """输入一个流式 token，返回可立即安全输出的文本（可能为空字符串）。"""
+        self._buf += token
+        return self._process()
+
+    def finalize(self) -> str:
+        """流结束时清空缓冲区；think 块内未闭合的内容一律丢弃。"""
+        if self._in_think:
+            self._buf = ""
+            return ""
+        out, self._buf = self._buf, ""
+        return out
+
+    def _process(self) -> str:
+        out: list[str] = []
+        while True:
+            if self._in_think:
+                idx = self._buf.find(self._CLOSE)
+                if idx != -1:
+                    # 找到结束标签：丢弃到标签末尾，跳过紧跟的换行
+                    self._buf = self._buf[idx + len(self._CLOSE):].lstrip("\n")
+                    self._in_think = False
+                    # 继续处理 </think> 之后的剩余内容
+                else:
+                    # 保留可能是 </think> 前缀的末尾部分，等待后续 token
+                    keep = next(
+                        (n for n in range(len(self._CLOSE) - 1, 0, -1)
+                         if self._buf.endswith(self._CLOSE[:n])),
+                        0,
+                    )
+                    self._buf = self._buf[-keep:] if keep else ""
+                    break
+            else:
+                idx = self._buf.find(self._OPEN)
+                if idx != -1:
+                    # 输出 <think> 之前的内容，进入 think 状态
+                    out.append(self._buf[:idx])
+                    self._buf = self._buf[idx + len(self._OPEN):]
+                    self._in_think = True
+                    # 继续处理 <think> 之后的剩余内容
+                else:
+                    # 末尾可能是 <think> 的某个前缀，暂存等待
+                    keep = next(
+                        (n for n in range(len(self._OPEN) - 1, 0, -1)
+                         if self._buf.endswith(self._OPEN[:n])),
+                        0,
+                    )
+                    safe_end = len(self._buf) - keep
+                    out.append(self._buf[:safe_end])
+                    self._buf = self._buf[safe_end:]
+                    break
+        return "".join(out)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -124,6 +200,11 @@ class DialogSystem:
         self._executor = MCPExecutor(server_url=mcp_server_url)
         self._chat_history: list[dict] = []
 
+        # 启动时预加载所有检索索引，避免每次 RAG 查询重复读取磁盘
+        self._vector_retriever = VectorRetriever()
+        self._bm25_retriever   = BM25Retriever()
+        self._graph_retriever  = GraphRetriever()
+
     # ── 1. 意图分类 ──────────────────────────────────────────────
 
     async def classify_intent(self, query: str) -> tuple[str, str]:
@@ -157,8 +238,8 @@ class DialogSystem:
 
     # ── 2. 简单对话（多轮，流式）─────────────────────────────────
 
-    async def handle_chat(self, query: str) -> str:
-        """流式调用大模型，边生成边打印，维持多轮对话历史。"""
+    async def handle_chat(self, query: str) -> AsyncGenerator[str, None]:
+        """流式调用大模型，逐 token yield；所有 chunk 产出后更新多轮历史。"""
         self._chat_history.append({"role": "user", "content": query})
         messages = [
             {"role": "system", "content": CHAT_SYSTEM},
@@ -177,40 +258,35 @@ class DialogSystem:
         async for chunk in stream:
             delta = chunk.choices[0].delta.content or ""
             if delta:
-                print(delta, end="", flush=True)
                 chunks.append(delta)
+                yield delta
 
         answer = "".join(chunks)
         self._chat_history.append({"role": "assistant", "content": answer})
         if len(self._chat_history) > 20:
             self._chat_history = self._chat_history[-20:]
-        return answer
 
     # ── 3. 知识检索（RAG，流式）──────────────────────────────────
 
-    async def handle_rag(self, query: str) -> str:
+    async def handle_rag(self, query: str) -> AsyncGenerator[str, None]:
         """三路检索 + RRF 融合后，流式生成 EH7 相关问题的回答。"""
-        vector_results = VectorRetriever().search(query, k=RETRIEVE_K)
-        bm25_results   = BM25Retriever().search(query, k=RETRIEVE_K)
-        graph_results  = GraphRetriever().search(query, k=RETRIEVE_K)
+        vector_results = self._vector_retriever.search(query, k=RETRIEVE_K)
+        bm25_results   = self._bm25_retriever.search(query, k=RETRIEVE_K)
+        graph_results  = self._graph_retriever.search(query, k=RETRIEVE_K)
         top_results    = reciprocal_rank_fusion(
             [vector_results, bm25_results, graph_results],
             top_n=TOP_N,
         )
 
-        chunks: list[str] = []
         async for delta in generate_answer_stream(query, top_results):
-            print(delta, end="", flush=True)
-            chunks.append(delta)
-
-        return "".join(chunks)
+            yield delta
 
     # ── 4. 远程调用（MCP，流式）──────────────────────────────────
 
-    async def handle_tool(self, query: str) -> str:
+    async def handle_tool(self, query: str) -> AsyncGenerator[str, None]:
         """
-        第一轮：让 LLM 从自然语言中提取工具名和参数（JSON 输出）。
-        第二轮：通过 MCP 执行工具，再流式生成自然语言回答。
+        第一轮：让 LLM 从自然语言中提取工具名和参数（JSON 输出，非流式）。
+        第二轮：通过 MCP 执行工具，再流式生成自然语言回答并逐 token yield。
         """
         extract_resp = await self._client.chat.completions.create(
             model=ALIBABA_MODEL,
@@ -252,21 +328,17 @@ class DialogSystem:
             stream=True,
         )
 
-        chunks: list[str] = []
         async for chunk in stream:
             delta = chunk.choices[0].delta.content or ""
             if delta:
-                print(delta, end="", flush=True)
-                chunks.append(delta)
-
-        return "".join(chunks)
+                yield delta
 
     # ── 5. 本地技能调用（Skills，流式）───────────────────────────
 
-    async def handle_skill(self, query: str) -> str:
+    async def handle_skill(self, query: str) -> AsyncGenerator[str, None]:
         """
-        第一轮：让 LLM 从自然语言中提取技能名和参数（JSON 输出）。
-        第二轮：本地执行技能，再流式生成自然语言回答。
+        第一轮：让 LLM 从自然语言中提取技能名和参数（JSON 输出，非流式）。
+        第二轮：本地执行技能，再流式生成自然语言回答并逐 token yield。
         """
         extract_resp = await self._client.chat.completions.create(
             model=ALIBABA_MODEL,
@@ -303,35 +375,29 @@ class DialogSystem:
             stream=True,
         )
 
-        chunks: list[str] = []
         async for chunk in stream:
             delta = chunk.choices[0].delta.content or ""
             if delta:
-                print(delta, end="", flush=True)
-                chunks.append(delta)
-
-        return "".join(chunks)
+                yield delta
 
     # ── 6. 道德伦理拦截 ───────────────────────────────────────────
 
-    async def handle_ethics(self, query: str) -> str:  # noqa: ARG002
-        """涉及不当内容时直接返回固定拒绝回复。"""
-        print(ETHICS_RESPONSE, end="", flush=True)
-        return ETHICS_RESPONSE
+    async def handle_ethics(self, query: str) -> AsyncGenerator[str, None]:  # noqa: ARG002
+        """涉及不当内容时直接 yield 固定拒绝回复。"""
+        yield ETHICS_RESPONSE
 
     # ── 7. 兜底话术 ───────────────────────────────────────────────
 
-    async def handle_fallback(self, query: str) -> str:  # noqa: ARG002
-        """超出系统能力范围时直接返回固定兜底回复。"""
-        print(FALLBACK_RESPONSE, end="", flush=True)
-        return FALLBACK_RESPONSE
+    async def handle_fallback(self, query: str) -> AsyncGenerator[str, None]:  # noqa: ARG002
+        """超出系统能力范围时直接 yield 固定兜底回复。"""
+        yield FALLBACK_RESPONSE
 
     # ── 8. 主处理入口 ─────────────────────────────────────────────
 
-    async def process(self, query: str, show_intent: bool = True) -> str:
+    async def process(self, query: str, show_intent: bool = True) -> AsyncGenerator[str, None]:
         """
-        分类意图，打印意图标签和"助手: "前缀，然后路由到对应的流式处理器。
-        处理器负责边生成边打印；本方法返回完整回答字符串（供程序化调用）。
+        分类意图，打印意图标签和"助手: "前缀，然后路由到对应的流式处理器，
+        将 handler 产出的 token 逐一 yield 给调用方。
 
         query 可能携带 /no_think 等模型控制前缀，分类时自动剥离以保证准确性；
         各 handler 接收原始 query（含前缀），用于抑制模型思考输出。
@@ -349,21 +415,31 @@ class DialogSystem:
                 "ethics":   "🚫 道德伦理",
                 "fallback": "❓ 兜底话术",
             }.get(intent, intent)
-            print(f"  [意图: {label}] {reason}")
+            print(f"[意图: {label}] {reason}")
 
         print("助手: ", end="", flush=True)
 
         if intent == "rag":
-            return await self.handle_rag(query)
-        if intent == "tool":
-            return await self.handle_tool(query)
-        if intent == "skill":
-            return await self.handle_skill(query)
-        if intent == "ethics":
-            return await self.handle_ethics(query)
-        if intent == "fallback":
-            return await self.handle_fallback(query)
-        return await self.handle_chat(query)
+            handler = self.handle_rag(query)
+        elif intent == "tool":
+            handler = self.handle_tool(query)
+        elif intent == "skill":
+            handler = self.handle_skill(query)
+        elif intent == "ethics":
+            handler = self.handle_ethics(query)
+        elif intent == "fallback":
+            handler = self.handle_fallback(query)
+        else:
+            handler = self.handle_chat(query)
+
+        stripper = ThinkStripper()
+        async for token in handler:
+            out = stripper.feed(token)
+            if out:
+                yield token
+        tail = stripper.finalize()
+        if tail:
+            yield tail
 
     # ── 9. 对话循环 ───────────────────────────────────────────────
 
@@ -378,7 +454,6 @@ class DialogSystem:
         while True:
             try:
                 query = input("\n你: ").strip()
-                query = "/no_think\n" + query
             except (EOFError, KeyboardInterrupt):
                 print("\n再见！")
                 break
@@ -389,10 +464,10 @@ class DialogSystem:
                 print("再见！")
                 break
 
-            print()
             try:
-                await self.process(query, show_intent=show_intent)
-                print()
+                query = "/no_think\n" + query
+                async for token in self.process(query, show_intent=show_intent):
+                    print(token, end="", flush=True)
             except Exception as exc:
                 print(f"\n[错误] {exc}")
 
