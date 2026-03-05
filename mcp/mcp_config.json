@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "math-server": {
+      "url": "http://localhost:8000/sse",
+      "description": "Math operations server with add, subtract, multiply, divide"
+    }
+  }
+}
