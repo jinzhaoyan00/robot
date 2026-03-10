@@ -18,6 +18,13 @@ model_cache/
 # 向量数据库 / 索引（二进制构建产物，可通过 main_index_builder.py 重建）
 vector_db/
 
+# 索引构建断点状态（运行时自动生成）
+tmp/
+
+# 知识库原始数据（show 分支保留，main 分支不纳入版本控制）
+data/txt/
+data/知识库-v2/
+
 # 编辑器
 .vscode/
 .idea/

@@ -21,16 +21,17 @@
   fixed_responses — 道德伦理拒绝回复 + 兜底话术
 """
 
-from prompts.intent_prompt import build_intent_system, VALID_INTENTS
+from prompts.intent_prompt import build_intent_system, VALID_INTENTS, VALID_RAG_TAGS
 from prompts.chat_prompt   import CHAT_SYSTEM
 from prompts.rag_prompt    import RAG_SYSTEM, build_rag_user_message
 from prompts.tool_prompt   import TOOL_EXTRACT_SYSTEM, TOOL_ANSWER_SYSTEM
 from prompts.skill_prompt  import build_skill_extract_system, SKILL_ANSWER_SYSTEM
-from prompts.fixed_responses import ETHICS_RESPONSE, FALLBACK_RESPONSE
+from prompts.fixed_responses import ETHICS_RESPONSE, FALLBACK_RESPONSE, SELF_INTRO_RESPONSE
 
 __all__ = [
     "build_intent_system",
     "VALID_INTENTS",
+    "VALID_RAG_TAGS",
     "CHAT_SYSTEM",
     "RAG_SYSTEM",
     "build_rag_user_message",
@@ -40,4 +41,5 @@ __all__ = [
     "SKILL_ANSWER_SYSTEM",
     "ETHICS_RESPONSE",
     "FALLBACK_RESPONSE",
+    "SELF_INTRO_RESPONSE",
 ]

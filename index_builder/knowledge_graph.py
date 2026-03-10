@@ -1,14 +1,14 @@
 """
 知识图谱构建模块
 使用 graphiti-core + KuZu 图数据库提取和存储知识图谱。
-LLM 采用阿里云 DashScope（OpenAI 兼容接口），嵌入模型采用 ModelScope GTE-base。
+LLM 采用阿里云 DashScope（OpenAI 兼容接口），嵌入模型采用 ModelScope BAAI/bge-large-zh。
 """
 
 import os
 import asyncio
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import List, Dict, Any
+from typing import Callable, List, Dict, Any, Optional
 
 from dotenv import load_dotenv
 from graphiti_core import Graphiti
@@ -18,6 +18,7 @@ from graphiti_core.embedder.client import EmbedderClient
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 
 from graphiti_core.llm_client.openai_base_client import DEFAULT_MAX_TOKENS
+from graphiti_core.nodes import EpisodeType
 
 
 from .embedder import GTEEmbedder as _GTEEmbedder
@@ -126,32 +127,110 @@ class KnowledgeGraph:
         conn.close()
         print("  FTS indices created.")
 
-    async def build(self, episodes: List[Dict[str, Any]]) -> None:
+
+    async def build(
+        self,
+        episodes: List[Dict[str, Any]],
+        start_from: int = 0,
+        on_episode_done: Optional[Callable[[int], None]] = None,
+    ) -> None:
         """
         从 episodes 列表构建知识图谱并写入 KuZu 数据库。
 
-        每个 episode dict 包含：
-            name (str)   : 片段名称
-            body (str)   : 文本内容
-            source (str) : 来源描述
+        参数：
+            episodes       : episode 字典列表，每项包含 document / metadata / id
+            start_from     : 跳过前 N 个 episode（断点续建时传入已完成数量）
+            on_episode_done: 每成功写入一个 episode 后调用，参数为累计完成总数；
+                             可用于在外部保存断点进度
         """
-        print(f"Building knowledge graph: {len(episodes)} episodes …")
+        total = len(episodes)
+        print(f"Building knowledge graph: {total} episodes ...")
+        if start_from > 0:
+            print(f"  断点续建：跳过前 {start_from} 个已完成的 episodes，"
+                  f"从第 {start_from + 1} 个开始")
+
         graphiti = self._build_graphiti()
         await graphiti.build_indices_and_constraints()
         # KuZu 驱动的 build_indices_and_constraints 是 no-op，需手动创建 FTS 索引
         self._create_fts_indices(graphiti)
 
+        completed = start_from  # 累计完成数（含本次运行前已写入的）
         for i, ep in enumerate(episodes):
-            print(f"  Episode {i + 1}/{len(episodes)}: {ep['name']}")
+            if i < start_from:
+                continue
+
+            ep_id = ep.get("id", str(i))
+            print(f"  Episode {i + 1}/{total}  ({ep_id})")
             try:
                 await graphiti.add_episode(
-                    name=ep["name"],
-                    episode_body=ep["body"],
-                    source_description=ep["source"],
+                    name=ep["metadata"]["category"],
+                    episode_body=ep["document"],
+                    source=EpisodeType.text,
+                    source_description="\t".join(ep["metadata"]["tags"]),
                     reference_time=datetime.now(timezone.utc),
                 )
+                completed += 1
+                if on_episode_done is not None:
+                    on_episode_done(completed)
             except Exception as exc:
-                print(f"  [WARN] Episode {ep['name']} skipped: {exc}")
+                print(f"  [WARN] Episode {ep_id} skipped: {exc}")
+
+        await graphiti.close()
+        print(f"Knowledge graph saved to: {self.db_path}")
+
+
+    async def build_error(
+        self,
+        episodes: List[Dict[str, Any]],
+        start_from: int = 0,
+        on_episode_done: Optional[Callable[[int], None]] = None,
+    ) -> None:
+        """
+        从 episodes 列表构建知识图谱并写入 KuZu 数据库。
+        .将错误的数据重新加入到图数据中，
+
+        参数：
+            episodes       : episode 字典列表，每项包含 document / metadata / id
+            start_from     : 跳过前 N 个 episode（断点续建时传入已完成数量）
+            on_episode_done: 每成功写入一个 episode 后调用，参数为累计完成总数；
+                             可用于在外部保存断点进度
+        """
+        total = len(episodes)
+        print(f"Building knowledge graph: {total} episodes ...")
+        if start_from > 0:
+            print(f"  断点续建：跳过前 {start_from} 个已完成的 episodes，"
+                  f"从第 {start_from + 1} 个开始")
+
+        graphiti = self._build_graphiti()
+        await graphiti.build_indices_and_constraints()
+        # KuZu 驱动的 build_indices_and_constraints 是 no-op，需手动创建 FTS 索引
+        self._create_fts_indices(graphiti)
+
+        completed = start_from  # 累计完成数（含本次运行前已写入的）
+        for i, ep in enumerate(episodes):
+            if i < start_from:
+                continue
+
+            ep_id = ep.get("id", str(i))
+            print(f"  Episode {i + 1}/{total}  ({ep_id})")
+            try:
+                error_list = ['209']
+                error_list = [int(item) for item in error_list]
+                if i+1 not in error_list:
+                    continue
+                print(ep["document"])
+                await graphiti.add_episode(
+                    name=ep["metadata"]["category"],
+                    episode_body=ep["document"],
+                    source=EpisodeType.text,
+                    source_description="\t".join(ep["metadata"]["tags"]),
+                    reference_time=datetime.now(timezone.utc),
+                )
+                completed += 1
+                if on_episode_done is not None:
+                    on_episode_done(completed)
+            except Exception as exc:
+                print(f"  [WARN] Episode {ep_id} skipped: {exc}")
 
         await graphiti.close()
         print(f"Knowledge graph saved to: {self.db_path}")

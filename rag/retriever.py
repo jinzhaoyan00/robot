@@ -23,7 +23,7 @@ def _resolve(key: str, default: str) -> str:
     p = Path(val)
     return str(p if p.is_absolute() else _PROJECT_ROOT / p)
 
-FAISS_DIR  = _resolve("FAISS_DIR",  "vector_db/faiss")
+CHROMA_DIR = _resolve("CHROMA_DIR", "vector_db/chromadb")
 BM25_DIR   = _resolve("BM25_DIR",   "vector_db/bm25")
 KUZU_DIR   = _resolve("KUZU_DIR",   "vector_db/kuzu_db")
 RETRIEVE_K = int(os.getenv("RETRIEVE_K", "20"))
@@ -37,19 +37,27 @@ from index_builder.bm25_index import BM25Index      # noqa: E402
 # ──────────────────────────────────────────────────────────────
 
 class VectorRetriever:
-    """基于 FAISS 向量索引的语义相似度检索。"""
+    """基于 ChromaDB 向量索引的语义相似度检索。"""
 
-    def __init__(self, store_path: str = FAISS_DIR):
+    def __init__(self, store_path: str = CHROMA_DIR):
         self._store = VectorStore(store_path)
 
-    def search(self, query: str, k: int = RETRIEVE_K) -> List[Dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        k: int = RETRIEVE_K,
+        tags: List[str] | None = None,
+    ) -> List[Dict[str, Any]]:
         """
         检索与 query 语义最相近的 k 条文档。
 
+        Args:
+            tags: 可选标签列表，不为空时只在对应分类中检索。
+
         Returns:
-            list of dict: 每条包含 text, file, line, score, source 字段。
+            list of dict: 每条包含 text, score, source 及 metadata 字段。
         """
-        results = self._store.search(query, k=k)
+        results = self._store.search(query, k=k, tags=tags)
         for r in results:
             r["source"] = "vector"
         return results

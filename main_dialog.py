@@ -3,7 +3,7 @@
 
 意图分类（由 LLM 判断）：
   chat     → 阿里云大模型直接生成回答（保持多轮对话历史）
-  rag      → RAG 混合检索 + 大模型生成（红旗 EH7 知识库）
+  rag      → RAG 混合检索 + 大模型生成（红旗 EH7/天工05/天工06/天工08 知识库）
   tool     → MCP 远程调用（数学计算）
   skill    → 本地技能调用（日期时间查询、单位换算等）
   ethics   → 道德伦理拦截（政治/恐怖/黄赌毒/歧视等不当内容）
@@ -39,11 +39,11 @@ from rag.reranker  import reciprocal_rank_fusion                           # noq
 from rag.generator import generate_answer_stream                           # noqa: E402
 import skills as _skills                                                   # noqa: E402
 from prompts import (                                                      # noqa: E402
-    build_intent_system, VALID_INTENTS,
+    build_intent_system, VALID_INTENTS, VALID_RAG_TAGS,
     CHAT_SYSTEM,
     TOOL_EXTRACT_SYSTEM, TOOL_ANSWER_SYSTEM,
     build_skill_extract_system, SKILL_ANSWER_SYSTEM,
-    ETHICS_RESPONSE, FALLBACK_RESPONSE,
+    ETHICS_RESPONSE, FALLBACK_RESPONSE, SELF_INTRO_RESPONSE,
 )
 
 
@@ -131,9 +131,9 @@ class MCPExecutor:
     """
     MCP 工具执行器。
 
-    优先尝试通过 MCP SSE 协议连接远程服务器（需要 mcp 包已安装）；
-    如果服务器不可达或 mcp 包未安装，则退回到本地直接执行（与
-    mcp/server.py 的实现逻辑完全一致）。
+    通过 MCP SSE 协议连接远程服务器调用工具（需要 mcp 包已安装）。
+    如果服务器不可达或 mcp 包未安装，call() 返回 None，
+    调用方应向用户提示服务不可用。
     """
 
     def __init__(self, server_url: str = "http://localhost:8000"):
@@ -143,9 +143,7 @@ class MCPExecutor:
     async def call(self, tool_name: str, arguments: dict[str, Any]) -> Any:
         """调用 MCP 工具，返回执行结果。"""
         result = await self._try_remote(tool_name, arguments)
-        if result is not None:
-            return result
-        return self._local_exec(tool_name, arguments)
+        return result
 
     async def _try_remote(self, tool_name: str, arguments: dict) -> Any | None:
         """尝试通过 SSE 连接远程 MCP 服务器。失败时返回 None。"""
@@ -167,23 +165,6 @@ class MCPExecutor:
             return None
         finally:
             sys.path = original_path
-
-    @staticmethod
-    def _local_exec(tool_name: str, arguments: dict) -> Any:
-        """本地直接执行（与 mcp/server.py 逻辑一致）。"""
-        a = float(arguments.get("a", 0))
-        b = float(arguments.get("b", 0))
-        if tool_name == "add":
-            return a + b
-        if tool_name == "subtract":
-            return a - b
-        if tool_name == "multiply":
-            return a * b
-        if tool_name == "divide":
-            if b == 0:
-                raise ValueError("Cannot divide by zero")
-            return a / b
-        raise ValueError(f"未知工具: {tool_name}")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -207,12 +188,14 @@ class DialogSystem:
 
     # ── 1. 意图分类 ──────────────────────────────────────────────
 
-    async def classify_intent(self, query: str) -> tuple[str, str]:
+    async def classify_intent(self, query: str) -> tuple[str, list[str], str]:
         """
-        调用 LLM 判断用户意图。
+        调用 LLM 判断用户意图，并在意图为 rag 时提取知识库标签。
 
         Returns:
-            (intent, reason)  intent ∈ VALID_INTENTS
+            (intent, tags, reason)
+              intent ∈ VALID_INTENTS
+              tags   — rag 意图下的知识库标签列表（其余意图为空列表）
         """
         system_prompt = build_intent_system(_skills.get_intent_hint())
         response = await self._client.chat.completions.create(
@@ -232,9 +215,11 @@ class DialogSystem:
             reason = parsed.get("reason", "")
             if intent not in VALID_INTENTS:
                 intent = "chat"
+            raw_tags = parsed.get("tags", []) if intent == "rag" else []
+            tags = [t for t in raw_tags if t in VALID_RAG_TAGS]
         except json.JSONDecodeError:
-            intent, reason = "chat", "JSON 解析失败，默认 chat"
-        return intent, reason
+            intent, tags, reason = "chat", [], "JSON 解析失败，默认 chat"
+        return intent, tags, reason
 
     # ── 2. 简单对话（多轮，流式）─────────────────────────────────
 
@@ -268,9 +253,16 @@ class DialogSystem:
 
     # ── 3. 知识检索（RAG，流式）──────────────────────────────────
 
-    async def handle_rag(self, query: str) -> AsyncGenerator[str, None]:
-        """三路检索 + RRF 融合后，流式生成 EH7 相关问题的回答。"""
-        vector_results = self._vector_retriever.search(query, k=RETRIEVE_K)
+    async def handle_rag(
+        self, query: str, tags: list[str] | None = None
+    ) -> AsyncGenerator[str, None]:
+        """
+        三路检索 + RRF 融合后，流式生成 EH7 相关问题的回答。
+
+        Args:
+            tags: 由意图分类返回的知识库标签，向量检索时作为 metadata 过滤条件。
+        """
+        vector_results = self._vector_retriever.search(query, k=RETRIEVE_K, tags=tags)
         bm25_results   = self._bm25_retriever.search(query, k=RETRIEVE_K)
         graph_results  = self._graph_retriever.search(query, k=RETRIEVE_K)
         top_results    = reciprocal_rank_fusion(
@@ -311,27 +303,30 @@ class DialogSystem:
             try:
                 result_str = str(await self._executor.call(fn_name, fn_args))
             except Exception as exc:
-                result_str = f"错误: {exc}"
+                result_str = None
         else:
-            result_str = "无法识别计算操作"
+            result_str = None
 
-        stream = await self._client.chat.completions.create(
-            model=ALIBABA_MODEL,
-            messages=[
-                {"role": "system",    "content": TOOL_ANSWER_SYSTEM},
-                {"role": "user",      "content": query},
-                {"role": "assistant", "content": f"计算结果：{result_str}"},
-                {"role": "user",      "content": "请用自然语言把计算结果告诉我。"},
-            ],
-            max_tokens=256,
-            temperature=0.3,
-            stream=True,
-        )
+        if result_str is None or result_str == "None":
+            yield '远程服务调用失败，请检测服务是否可用。'
+        else:
+            stream = await self._client.chat.completions.create(
+                model=ALIBABA_MODEL,
+                messages=[
+                    {"role": "system",    "content": TOOL_ANSWER_SYSTEM},
+                    {"role": "user",      "content": query},
+                    {"role": "assistant", "content": f"计算结果：{result_str}"},
+                    {"role": "user",      "content": "请用自然语言把计算结果告诉我。"},
+                ],
+                max_tokens=256,
+                temperature=0.3,
+                stream=True,
+            )
 
-        async for chunk in stream:
-            delta = chunk.choices[0].delta.content or ""
-            if delta:
-                yield delta
+            async for chunk in stream:
+                delta = chunk.choices[0].delta.content or ""
+                if delta:
+                    yield delta
 
     # ── 5. 本地技能调用（Skills，流式）───────────────────────────
 
@@ -380,19 +375,25 @@ class DialogSystem:
             if delta:
                 yield delta
 
-    # ── 6. 道德伦理拦截 ───────────────────────────────────────────
+    # ── 6. 自我介绍 ───────────────────────────────────────────────
+
+    async def handle_self_intro(self, query: str) -> AsyncGenerator[str, None]:  # noqa: ARG002
+        """用户询问助手身份时直接 yield 固定自我介绍回复。"""
+        yield SELF_INTRO_RESPONSE
+
+    # ── 7. 道德伦理拦截 ───────────────────────────────────────────
 
     async def handle_ethics(self, query: str) -> AsyncGenerator[str, None]:  # noqa: ARG002
         """涉及不当内容时直接 yield 固定拒绝回复。"""
         yield ETHICS_RESPONSE
 
-    # ── 7. 兜底话术 ───────────────────────────────────────────────
+    # ── 8. 兜底话术 ───────────────────────────────────────────────
 
     async def handle_fallback(self, query: str) -> AsyncGenerator[str, None]:  # noqa: ARG002
         """超出系统能力范围时直接 yield 固定兜底回复。"""
         yield FALLBACK_RESPONSE
 
-    # ── 8. 主处理入口 ─────────────────────────────────────────────
+    # ── 9. 主处理入口 ─────────────────────────────────────────────
 
     async def process(self, query: str, show_intent: bool = True) -> AsyncGenerator[str, None]:
         """
@@ -404,27 +405,31 @@ class DialogSystem:
         """
         # 剥离 /no_think 等控制前缀，仅用于意图分类
         classify_query = re.sub(r"^(/no_think|/think)\s*\n?", "", query).strip()
-        intent, reason = await self.classify_intent(classify_query)
+        intent, tags, reason = await self.classify_intent(classify_query)
 
         if show_intent:
             label = {
-                "chat":     "💬 对话",
-                "rag":      "📚 知识检索",
-                "tool":     "🔧 远程调用",
-                "skill":    "⚙️ 工具调用",
-                "ethics":   "🚫 道德伦理",
-                "fallback": "❓ 兜底话术",
+                "chat":       "💬 简单对话",
+                "rag":        "📚 知识检索",
+                "tool":       "🔧 远程调用",
+                "skill":      "⚙️ 工具调用",
+                "self_intro": "🤖 自我介绍",
+                "ethics":     "🚫 道德伦理",
+                "fallback":   "❓ 兜底话术",
             }.get(intent, intent)
-            print(f"[意图: {label}] {reason}")
+            tag_hint = f" [{', '.join(tags)}]" if tags else ""
+            print(f"[意图: {label}{tag_hint}] {reason}")
 
         print("助手: ", end="", flush=True)
 
         if intent == "rag":
-            handler = self.handle_rag(query)
+            handler = self.handle_rag(query, tags=tags)
         elif intent == "tool":
             handler = self.handle_tool(query)
         elif intent == "skill":
             handler = self.handle_skill(query)
+        elif intent == "self_intro":
+            handler = self.handle_self_intro(query)
         elif intent == "ethics":
             handler = self.handle_ethics(query)
         elif intent == "fallback":
@@ -436,18 +441,18 @@ class DialogSystem:
         async for token in handler:
             out = stripper.feed(token)
             if out:
-                yield token
+                yield out
         tail = stripper.finalize()
         if tail:
             yield tail
 
-    # ── 9. 对话循环 ───────────────────────────────────────────────
+    # ── 10. 对话循环 ──────────────────────────────────────────────
 
     async def run(self, show_intent: bool = True) -> None:
         """启动交互式对话循环，输入 exit/quit 退出。"""
         print("=" * 60)
-        print("  红旗 EH7 智能对话助手")
-        print("  支持：日常对话 | EH7 知识查询 | 数学计算 | 工具调用")
+        print("  红旗汽车智能对话助手（EH7 / 天工05 / 天工06 / 天工08）")
+        print("  支持：日常对话 | 红旗汽车知识查询 | 本地技能 | 远程工具调用")
         print("  输入 exit 或 quit 退出")
         print("=" * 60)
 
@@ -478,7 +483,7 @@ class DialogSystem:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="红旗 EH7 智能对话助手（意图识别 + RAG + MCP 远程调用）"
+        description="红旗汽车智能对话助手（意图识别 + RAG + MCP 远程调用）"
     )
     parser.add_argument(
         "--mcp-url",

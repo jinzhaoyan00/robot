@@ -1,0 +1,10 @@
+# Fine-tuning dependencies for BAAI/bge-large-zh
+# Install with: pip install -r finetune/requirements_finetune.txt
+
+sentence-transformers>=3.0.0
+datasets>=2.14.0
+accelerate>=0.20.0
+
+# Already in requirements.txt but listed here for standalone installs
+torch>=2.0.0
+transformers>=4.30.0
