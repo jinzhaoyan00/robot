@@ -21,9 +21,8 @@ vector_db/
 # 索引构建断点状态（运行时自动生成）
 tmp/
 
-# 知识库原始数据（show 分支保留，main 分支不纳入版本控制）
-data/txt/
-data/知识库-v2/
+# 微调训练数据输出（由 data_process/ 脚本生成）
+data_process/data/
 
 # 编辑器
 .vscode/
